@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: addopencodeskill <project_dir> <skills_dir> [options]
+
+Install skills into a project's .opencode/skills/ directory.
+
+Arguments:
+  project_dir   Path to the project root (where .opencode/ will be created)
+  skills_dir    Path to directory containing skill folders (each with SKILL.md)
+
+Options:
+  -c, --copy      Copy skills (default: symlink for live updates)
+  -s, --symlink   Symlink skills (changes in source reflect immediately)
+  -f, --force     Overwrite existing skills
+  -n, --dry-run   Show what would be done without doing it
+  -h, --help      Show this help
+
+Examples:
+  addopencodeskill ~/works/github/nucleus ~/.config/opencode/skill-libraries/backend
+  addopencodeskill ~/projects/app ~/.config/opencode/skills --copy
+  addopencodeskill ~/repo --skills-filter "api-*,design-*"
+EOF
+  exit 0
+}
+
+log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; }
+
+# --- defaults ---
+MODE="symlink"
+FORCE=false
+DRY_RUN=false
+FILTER=""
+
+# --- parse args ---
+PROJECT_DIR=""
+SKILLS_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)    usage ;;
+    -c|--copy)    MODE="copy"; shift ;;
+    -s|--symlink) MODE="symlink"; shift ;;
+    -f|--force)   FORCE=true; shift ;;
+    -n|--dry-run) DRY_RUN=true; shift ;;
+    --skills-filter) FILTER="$2"; shift 2 ;;
+    -*)           err "Unknown option: $1"; usage ;;
+    *)
+      if [[ -z "$PROJECT_DIR" ]]; then
+        PROJECT_DIR="$1"
+      elif [[ -z "$SKILLS_DIR" ]]; then
+        SKILLS_DIR="$1"
+      else
+        err "Unexpected argument: $1"
+        usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$PROJECT_DIR" && -n "$SKILLS_DIR" ]] || usage
+
+# --- resolve paths ---
+PROJECT_DIR="$(realpath -m "$PROJECT_DIR")"
+SKILLS_DIR="$(realpath -m "$SKILLS_DIR")"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  err "Project directory does not exist: $PROJECT_DIR"
+  exit 1
+fi
+
+if [[ ! -d "$SKILLS_DIR" ]]; then
+  err "Skills directory does not exist: $SKILLS_DIR"
+  exit 1
+fi
+
+TARGET_DIR="$PROJECT_DIR/.opencode/skills"
+
+# --- collect skills ---
+mapfile -t SKILLS < <(find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+
+if [[ ${#SKILLS[@]} -eq 0 ]]; then
+  err "No skill directories found in: $SKILLS_DIR"
+  exit 1
+fi
+
+# apply filter if set
+if [[ -n "$FILTER" ]]; then
+  mapfile -t SKILLS < <(printf '%s\n' "${SKILLS[@]}" | grep -E "$(echo "$FILTER" | sed 's/,/|/g')") || true
+  if [[ ${#SKILLS[@]} -eq 0 ]]; then
+    err "No skills matched filter: $FILTER"
+    exit 1
+  fi
+fi
+
+log "Project:  $PROJECT_DIR"
+log "Skills:   $SKILLS_DIR (${#SKILLS[@]} found)"
+log "Target:   $TARGET_DIR"
+log "Mode:     $MODE"
+[[ "$DRY_RUN" == true ]] && log "DRY-RUN:  enabled (no changes will be made)"
+echo
+
+# --- create target dir ---
+if [[ "$DRY_RUN" == false ]]; then
+  mkdir -p "$TARGET_DIR"
+fi
+
+# --- install skills ---
+INSTALLED=0
+SKIPPED=0
+FAILED=0
+
+for skill_path in "${SKILLS[@]}"; do
+  name="$(basename "$skill_path")"
+  dest="$TARGET_DIR/$name"
+
+  # skip if source has no SKILL.md
+  if [[ ! -f "$skill_path/SKILL.md" ]]; then
+    warn "Skipping '$name' (no SKILL.md found)"
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  # handle existing
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    if [[ "$FORCE" == false ]]; then
+      warn "Skipping '$name' (already exists, use --force to overwrite)"
+      SKIPPED=$((SKIPPED + 1))
+      continue
+    fi
+    if [[ "$DRY_RUN" == false ]]; then
+      rm -rf "$dest"
+    fi
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] Would $MODE '$name'"
+    INSTALLED=$((INSTALLED + 1))
+    continue
+  fi
+
+  if [[ "$MODE" == "symlink" ]]; then
+    if ln -s "$skill_path" "$dest" 2>/dev/null; then
+      log "Symlinked: $name"
+      INSTALLED=$((INSTALLED + 1))
+    else
+      err "Failed to symlink '$name'"
+      FAILED=$((FAILED + 1))
+    fi
+  else
+    if cp -r "$skill_path" "$dest" 2>/dev/null; then
+      log "Copied:    $name"
+      INSTALLED=$((INSTALLED + 1))
+    else
+      err "Failed to copy '$name'"
+      FAILED=$((FAILED + 1))
+    fi
+  fi
+done
+
+# --- write marker ---
+if [[ "$DRY_RUN" == false && $INSTALLED -gt 0 ]]; then
+  cat > "$TARGET_DIR/.addopencodeskill-manifest" <<EOF
+# Managed by addopencodeskill
+# Installed: $(date -Iseconds)
+# Mode: $MODE
+# Source: $SKILLS_DIR
+# Count: $INSTALLED
+
+$(printf '%s\n' "${SKILLS[@]}" | xargs -I{} basename {})
+EOF
+fi
+
+echo
+log "Done. Installed: $INSTALLED  |  Skipped: $SKIPPED  |  Failed: $FAILED"
+
+if [[ "$DRY_RUN" == false && $INSTALLED -gt 0 ]]; then
+  echo
+  log "Skills now available in: $TARGET_DIR"
+  log "Restart opencode in that project to pick them up."
+fi
